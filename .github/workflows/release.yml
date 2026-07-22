@@ -1,0 +1,234 @@
+# Put this in your PUBLIC repo at: .github/workflows/release.yml
+#
+# It keeps SOURCE in your private repo and does the build + publish + release
+# here (public). The private source is only checked out into the ephemeral CI
+# runner — never committed to the public repo.
+#
+# ── One-time setup (in this PUBLIC repo → Settings → Secrets and variables → Actions) ──
+#   SOURCE_REPO_TOKEN  : a GitHub PAT (fine-grained, read access to the private source repo)
+#   NPM_TOKEN          : npm automation token (publishes @routerbench/cli)
+#   VSCE_PAT           : Azure DevOps PAT, Marketplace > Manage (publishes the extension)
+#   (optional) OVSX_TOKEN : open-vsx.org token
+#   (desktop signing, optional) APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD,
+#     APPLE_API_KEY, APPLE_API_ISSUER, AZURE_CLIENT_ID/TENANT_ID/SUBSCRIPTION_ID, etc.
+#
+# ── EDIT THESE to your repos ──
+#   SOURCE_REPO below  = your PRIVATE source repo (owner/name)
+#   releases land in   = this public repo (github.repository, automatic)
+
+name: release
+run-name: "release v${{ inputs.version }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 1.0.0)"
+        required: true
+        type: string
+      desktop:
+        description: "Also build the desktop app (heavier)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # create releases + upload binaries in THIS public repo
+
+env:
+  SOURCE_REPO: routerbench/routerbench-cli # your PRIVATE source repo
+  SOURCE_REF: dev
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: routerbench
+    env:
+      HAS_OVSX: ${{ secrets.OVSX_TOKEN != '' }}
+      HAS_VSCE: ${{ secrets.VSCE_PAT != '' }}
+    steps:
+      - name: Check out PRIVATE source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ env.SOURCE_REF }}
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - run: bun install
+
+      - name: Create GitHub Release (this public repo)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ inputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --title "RouterBench v${{ inputs.version }}" \
+            --notes "RouterBench v${{ inputs.version }}" || echo "release exists, continuing"
+
+      # ── CLI: build cross-platform binaries + upload archives to the release ──
+      - name: Build CLI
+        working-directory: packages/routerbench
+        env:
+          ROUTERBENCH_VERSION: ${{ inputs.version }}
+          ROUTERBENCH_RELEASE: "true"
+          GH_REPO: ${{ github.repository }} # binaries upload to THIS public repo's release
+          GH_TOKEN: ${{ github.token }}
+        run: bun run build
+
+      # ── CLI: publish @routerbench/cli + platform packages to npm ──
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish @routerbench/cli to npm
+        working-directory: packages/routerbench
+        env:
+          ROUTERBENCH_VERSION: ${{ inputs.version }}
+          ROUTERBENCH_RELEASE: "true"
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "false"
+        run: bun ./script/publish.ts
+
+      # ── VS Code extension: package + publish ──
+      - name: Publish VS Code extension
+        if: env.HAS_VSCE == 'true'
+        working-directory: sdks/vscode
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          bun install
+          bun install -g @vscode/vsce
+          vsce package --no-git-tag-version --no-update-package-json --no-dependencies --skip-license -o dist/routerbench.vsix "${{ inputs.version }}"
+          vsce publish --packagePath dist/routerbench.vsix
+
+      - name: Publish extension to Open VSX (optional)
+        if: env.HAS_OVSX == 'true'
+        working-directory: sdks/vscode
+        run: npx ovsx publish dist/routerbench.vsix -p "${{ secrets.OVSX_TOKEN }}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # DESKTOP — builds + (optionally) signs the electron app per-OS and uploads
+  # the installers to this public repo's Release. Runs after `release` (so the
+  # GitHub Release + tag exist). Builds the CLI first (it's bundled as the
+  # desktop's sidecar), then electron-builder packages + signs.
+  #
+  # Signing is OPTIONAL: if the cert secrets are absent, electron-builder makes
+  # UNSIGNED builds (fine for testing; macOS/Windows users get a Gatekeeper /
+  # SmartScreen warning). To ship signed:
+  #   macOS   → APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
+  #             APPLE_API_KEY (base64 .p8), APPLE_API_KEY_ID, APPLE_API_ISSUER  (notarization)
+  #   Windows → WINDOWS_CERTIFICATE (base64 .pfx), WINDOWS_CERTIFICATE_PASSWORD
+  #             (or adapt opencode's Azure Trusted Signing job from the private source)
+  desktop:
+    needs: release
+    if: ${{ inputs.desktop }}
+    environment: routerbench
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: macos-latest # Apple silicon
+            flag: --mac --arm64
+            bun_flags: --os=darwin --cpu=arm64
+          # Intel Mac (macos-13) dropped: GitHub is retiring Intel runners, so
+          # the job queued 2.5h+ without ever getting one. Apple Silicon Macs
+          # are covered above; Intel Mac users use the npm CLI.
+          - host: windows-latest
+            flag: --win --x64
+            bun_flags: --os=win32 --cpu=x64
+          - host: ubuntu-latest
+            flag: --linux --x64
+            bun_flags: --os=linux --cpu=x64
+    runs-on: ${{ matrix.host }}
+    env:
+      # secrets can't be read in `if:` directly — surface presence as job env
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
+      HAS_APPLE_KEY: ${{ secrets.APPLE_API_KEY != '' }}
+    steps:
+      - name: Check out PRIVATE source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ env.SOURCE_REF }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install rpm (linux packaging)
+        if: startsWith(matrix.host, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm
+
+      - name: Import Apple signing certificate
+        if: startsWith(matrix.host, 'macos') && env.HAS_APPLE_CERT == 'true'
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Setup Apple notarization key
+        if: startsWith(matrix.host, 'macos') && env.HAS_APPLE_KEY == 'true'
+        shell: bash
+        run: |
+          echo "${{ secrets.APPLE_API_KEY }}" | base64 -d > "$RUNNER_TEMP/apple-api-key.p8"
+          echo "APPLE_API_KEY=$RUNNER_TEMP/apple-api-key.p8" >> "$GITHUB_ENV"
+
+      - run: bun install
+        env:
+          # ensure the platform-native optional deps (node-pty, watcher) resolve
+          BUN_INSTALL_FLAGS: ${{ matrix.bun_flags }}
+
+      - name: Build CLI (bundled as the desktop sidecar)
+        working-directory: packages/routerbench
+        env:
+          ROUTERBENCH_VERSION: ${{ inputs.version }}
+        run: bun run build --single
+
+      - name: Prepare + build desktop
+        working-directory: packages/desktop
+        env:
+          ROUTERBENCH_VERSION: ${{ inputs.version }}
+          ROUTERBENCH_CHANNEL: prod
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          bun run scripts/prepare.ts
+          bun run build
+
+      - name: Package + sign (electron-builder)
+        working-directory: packages/desktop
+        env:
+          ROUTERBENCH_CHANNEL: prod
+          # macOS signing/notarization (empty = unsigned)
+          CSC_LINK: ${{ secrets.APPLE_CERTIFICATE }}
+          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          # Windows signing (empty = unsigned)
+          WIN_CSC_LINK: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: npx electron-builder ${{ matrix.flag }} --publish never --config electron-builder.config.ts
+        timeout-minutes: 60
+
+      - name: Upload installers to the Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(packages/desktop/dist/*.dmg packages/desktop/dist/*.exe packages/desktop/dist/*.AppImage packages/desktop/dist/*.deb packages/desktop/dist/*.rpm packages/desktop/dist/*.zip)
+          if (( ${#files[@]} )); then
+            gh release upload "v${{ inputs.version }}" "${files[@]}" --repo "${{ github.repository }}" --clobber
+          else
+            echo "No desktop installers produced for ${{ matrix.flag }}"
+          fi
