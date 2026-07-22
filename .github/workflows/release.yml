@@ -36,7 +36,7 @@ permissions:
   contents: write # create releases + upload binaries in THIS public repo
 
 env:
-  SOURCE_REPO: routerbench/routerbench-cli # your PRIVATE source repo
+  SOURCE_REPO: aivfkesavan/routerbench-cli # your PRIVATE source repo
   SOURCE_REF: main
 
 jobs:
