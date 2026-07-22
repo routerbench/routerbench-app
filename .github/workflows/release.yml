@@ -37,7 +37,7 @@ permissions:
 
 env:
   SOURCE_REPO: routerbench/routerbench-cli # your PRIVATE source repo
-  SOURCE_REF: dev
+  SOURCE_REF: main
 
 jobs:
   release:
